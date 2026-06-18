@@ -787,9 +787,9 @@ async function checkout(){
       if(ex)await dbUpdate('customers',ex.id,{totalTransaksi:(ex.totalTransaksi||0)+1,totalPembelian:(ex.totalPembelian||0)+total,lastPurchase:new Date().toISOString()});
       else await dbAdd('customers',{name:customer,wa:'',alamat:'',totalTransaksi:1,totalPembelian:total,lastPurchase:new Date().toISOString()});
     }
-    // update local stock
+    // update stock & persist to cloud so it doesn't revert on refresh
     cart.forEach(item=>{const pd=LD.products?.find(p=>p.id===item.parfumId);if(pd)pd.stok=Math.max(0,(pd.stok||0)-(item.size*item.qty));});
-    saveLD();setSyncStatus('ok');
+    await saveSettings();setSyncStatus('ok');
     cart=[];rCart();
     document.getElementById('c-inp').value='';document.getElementById('n-inp').value='';
     document.getElementById('t-disc').value='0';document.getElementById('t-ongkir').value='0';
@@ -1177,7 +1177,7 @@ async function doRestore(){
       setSyncStatus('ok');
     }else{LD.transactions=restoreObj.transactions||[];LD.customers=restoreObj.customers||[];LD.expenses=restoreObj.expenses||[];}
     if(restoreObj.products)LD.products=restoreObj.products;if(restoreObj.inventory)LD.inventory=restoreObj.inventory;if(restoreObj.prices)LD.prices=restoreObj.prices;if(restoreObj.target)LD.target=restoreObj.target;
-    saveLD();showNotif('✅ Data berhasil dipulihkan!','success');setTimeout(()=>nav('dashboard'),1200);
+    await saveSettings();showNotif('✅ Data berhasil dipulihkan!','success');setTimeout(()=>nav('dashboard'),1200);
   }catch(e){setSyncStatus('err');showNotif('Gagal restore: '+e.message,'error');}
 }
 
