@@ -387,7 +387,9 @@ let LD={
   products:PERFUMES.map(p=>({...p,modalPerMl:DEFAULT_MODAL[p.id]||2000,stok:500,supplier:'',restockDate:'',notes:''})),
   inventory:{botol1:0,botol2:0,botol5:0,botol10:0,atomizer:0,packaging:0,label:0,bubblewrap:0},
   prices:JSON.parse(JSON.stringify(DEFAULT_PRICES)),
-  target:{monthly:5000000}
+  target:{monthly:5000000},
+  // Saldo awal manual (karena histori sebelumnya tidak tercatat rapi). Cash & Digital dihitung terpisah mulai dari tanggal ini.
+  saldoAwal:{cash:636000,digital:510000,date:new Date().toISOString()}
 };
 
 // ===== UTILS =====
@@ -396,6 +398,14 @@ const dStr=d=>new Date(d||Date.now()).toLocaleDateString('id-ID',{day:'2-digit',
 const dKey=d=>{const dt=new Date(d||Date.now());return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0')};
 const mKey=d=>{const dt=new Date(d||Date.now());return dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')};
 const wKey=d=>{const dt=new Date(d||Date.now());const s=new Date(dt);s.setDate(dt.getDate()-dt.getDay());return dKey(s)};
+// Urutkan array transaksi/pengeluaran berdasarkan tanggal & waktu ASLI (bukan urutan input/array), desc=true => terbaru dulu
+function sortByDate(arr,desc=true){
+  return [...(arr||[])].sort((a,b)=>{
+    const da=new Date(a.date||0).getTime()||0;
+    const db=new Date(b.date||0).getTime()||0;
+    return desc?(db-da):(da-db);
+  });
+}
 function showNotif(msg,type=''){
   const n=document.getElementById('notif');
   n.textContent=msg;n.className='notif show '+(type||'');
@@ -490,6 +500,7 @@ async function loadSettings(){
       if(s.inventory)LD.inventory=s.inventory;
       if(s.prices)LD.prices=s.prices;
       if(s.target)LD.target=s.target;
+      if(s.saldoAwal)LD.saldoAwal=s.saldoAwal;
       saveLD();
     }
   }catch(e){console.error(e);}
@@ -500,7 +511,7 @@ async function saveSettings(){
     try{
       setSyncStatus('loading');
       await fbDb.collection('settings').doc('data').set({
-        products:LD.products,inventory:LD.inventory,prices:LD.prices,target:LD.target,
+        products:LD.products,inventory:LD.inventory,prices:LD.prices,target:LD.target,saldoAwal:LD.saldoAwal,
         updatedAt:new Date().toISOString(),updatedBy:currentUser?.name||currentUser?.email||''
       });
       setSyncStatus('ok');
@@ -945,38 +956,129 @@ function rInventory(){
 async function saveInv(){await saveSettings();showNotif('Inventory disimpan!','success');}
 
 // ===== KEUANGAN =====
+const EXPENSE_CATEGORIES=['Beli Parfum','Botol 2ml','Botol 5ml','Botol 10ml','Kertas/Label','Bubble Wrap','Kardus/Packaging','Ongkir','Operasional','Lainnya'];
+// Metode pembayaran mana yang masuk kantong CASH vs kantong DIGITAL (QRIS/Transfer/E-Wallet)
+function walletOfPayment(p){return p==='Cash'?'Cash':'Digital';}
 async function rKeuangan(){
   const pg=document.getElementById('pg-keuangan');
   pg.innerHTML='<div class="loading"><div class="spinner"></div>Memuat...</div>';
-  const txs=await dbGet('transactions');const exps=await dbGet('expenses');
-  const mn=mKey();const mTx=txs.filter(t=>mKey(t.date)===mn);const mEx=exps.filter(e=>mKey(e.date)===mn);
+  const txsRaw=await dbGet('transactions');const expsRaw=await dbGet('expenses');
   const sum=(a,f)=>a.reduce((s,x)=>s+(x[f]||0),0);
+  const sa=LD.saldoAwal||{cash:0,digital:0,date:new Date().toISOString()};
+  const baseDate=new Date(sa.date||0);
+
+  // ----- Bulan berjalan (ringkasan umum) -----
+  const mn=mKey();const mTx=txsRaw.filter(t=>mKey(t.date)===mn);const mEx=expsRaw.filter(e=>mKey(e.date)===mn);
   const income=sum(mTx,'total');const expense=sum(mEx,'amount');const netP=sum(mTx,'profit')-expense;
+
+  // ----- Sejak Saldo Awal diset: pisahkan CASH vs DIGITAL, otomatis berkurang/bertambah -----
+  const sinceTx=txsRaw.filter(t=>new Date(t.date)>=baseDate);
+  const sinceEx=expsRaw.filter(e=>new Date(e.date)>=baseDate);
+  const cashInSum=sum(sinceTx.filter(t=>walletOfPayment(t.payment)==='Cash'),'total');
+  const digitalInSum=sum(sinceTx.filter(t=>walletOfPayment(t.payment)==='Digital'),'total');
+  const cashOutSum=sum(sinceEx.filter(e=>(e.metode||'Cash')==='Cash'),'amount');
+  const digitalOutSum=sum(sinceEx.filter(e=>(e.metode||'Cash')==='Digital'),'amount');
+  const cashBalance=(sa.cash||0)+cashInSum-cashOutSum;
+  const digitalBalance=(sa.digital||0)+digitalInSum-digitalOutSum;
+  const totalBalance=cashBalance+digitalBalance;
+  const totalOmsetSince=cashInSum+digitalInSum;
+  const totalPengeluaranSince=cashOutSum+digitalOutSum;
+  const profitBersihSince=sum(sinceTx,'profit')-totalPengeluaranSince;
+
+  // ----- Buku Kas: gabungan pemasukan (omset) & pengeluaran sejak Saldo Awal, kronologis ASLI + saldo berjalan per kantong -----
+  const ledgerRaw=[
+    ...sinceTx.map(t=>({date:t.date,type:'in',wallet:walletOfPayment(t.payment),desc:'Penjualan — '+(t.customer||'Umum')+' ('+(t.payment||'-')+')',amount:t.total||0,ref:t.id,kind:'tx'})),
+    ...sinceEx.map(e=>({date:e.date,type:'out',wallet:(e.metode||'Cash'),desc:(e.category||'Pengeluaran')+(e.description?' — '+e.description:''),amount:e.amount||0,ref:e.id,kind:'exp'}))
+  ];
+  const ledgerAsc=sortByDate(ledgerRaw,false); // ascending: lama -> baru, waktu tidak diacak
+  let rCash=sa.cash||0,rDigital=sa.digital||0;
+  const ledgerWithBalance=ledgerAsc.map(x=>{
+    const delta=x.type==='in'?x.amount:-x.amount;
+    if(x.wallet==='Cash')rCash+=delta;else rDigital+=delta;
+    return{...x,balCash:rCash,balDigital:rDigital,balTotal:rCash+rDigital};
+  });
+  const openingRow={date:sa.date,opening:true,balCash:sa.cash||0,balDigital:sa.digital||0,balTotal:(sa.cash||0)+(sa.digital||0)};
+  const ledgerDesc=[...ledgerWithBalance].reverse().slice(0,60); // tampilkan terbaru dulu, maksimal 60 baris
+
   pg.innerHTML=`
-  <div class="section-header"><div class="gold-line"></div><div class="section-title">Keuangan</div><button class="btn btn-outline" onclick="openAddExp()">+ Pengeluaran</button></div>
+  <div class="section-header"><div class="gold-line"></div><div class="section-title">Keuangan</div><button class="btn btn-outline btn-sm" onclick="openSetSaldoAwal()">⚙ Atur Saldo Awal</button><button class="btn btn-outline" onclick="openAddExp()">+ Pengeluaran</button></div>
+
+  <div class="card" style="border-color:var(--border-bright)">
+    <div class="card-header"><div class="card-title">🏦 Saldo Kas — Cash & Digital (Otomatis)</div></div>
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">💵 Saldo Cash</div><div class="stat-value ${cashBalance<0?'text-danger':'text-gold'}" style="font-size:1.35rem">${idr(cashBalance)}</div><div class="stat-sub">Masuk ${idr(cashInSum)} / Keluar ${idr(cashOutSum)}</div><div class="stat-icon">💵</div></div>
+      <div class="stat-card"><div class="stat-label">📱 Saldo Digital (QRIS/Transfer)</div><div class="stat-value ${digitalBalance<0?'text-danger':'text-gold'}" style="font-size:1.35rem">${idr(digitalBalance)}</div><div class="stat-sub">Masuk ${idr(digitalInSum)} / Keluar ${idr(digitalOutSum)}</div><div class="stat-icon">📱</div></div>
+      <div class="stat-card"><div class="stat-label">Total Saldo Kas</div><div class="stat-value ${totalBalance<0?'text-danger':'text-gold'}" style="font-size:1.5rem">${idr(totalBalance)}</div><div class="stat-icon">🏦</div></div>
+      <div class="stat-card"><div class="stat-label">Profit Bersih (Sejak Saldo Awal)</div><div class="stat-value ${profitBersihSince<0?'text-danger':'text-gold'}">${idr(profitBersihSince)}</div><div class="stat-icon">📈</div></div>
+    </div>
+    <div style="font-size:0.75rem;color:var(--text-muted);margin-top:2px">Saldo awal diinput manual: Cash ${idr(sa.cash||0)} + Digital ${idr(sa.digital||0)} pada ${dStr(sa.date)}. Mulai tanggal itu, setiap transaksi (masuk sesuai metode bayar) dan pengeluaran (sesuai sumber dana) otomatis menambah/mengurangi saldo di atas — cash dan digital dihitung terpisah.</div>
+  </div>
+
+  <div class="card-header" style="margin-top:0.4rem"><div class="card-title" style="font-size:0.75rem;color:var(--text-muted)">📅 RINGKASAN BULAN INI — ${new Date().toLocaleDateString('id-ID',{month:'long',year:'numeric'})}</div></div>
   <div class="stats-grid">
     <div class="stat-card"><div class="stat-label">Pemasukan Bulan Ini</div><div class="stat-value text-success">${idr(income)}</div><div class="stat-icon">💰</div></div>
     <div class="stat-card"><div class="stat-label">Pengeluaran Bulan Ini</div><div class="stat-value text-danger">${idr(expense)}</div><div class="stat-icon">💸</div></div>
-    <div class="stat-card"><div class="stat-label">Profit Bersih</div><div class="stat-value text-gold">${idr(netP)}</div><div class="stat-icon">📈</div></div>
+    <div class="stat-card"><div class="stat-label">Profit Bersih Bulan Ini</div><div class="stat-value text-gold">${idr(netP)}</div><div class="stat-icon">📈</div></div>
   </div>
+
+  <div class="card"><div class="card-header"><div class="card-title">📖 Buku Kas — Riwayat Berurutan Sesuai Tanggal & Waktu (Cash vs Digital)</div></div>
+  <div class="table-wrap" style="max-height:380px;overflow-y:auto"><table><thead><tr><th>Tanggal</th><th>Jam</th><th>Keterangan</th><th>Sumber</th><th>Masuk</th><th>Keluar</th><th>Saldo Cash</th><th>Saldo Digital</th><th>Total</th></tr></thead><tbody>
+  <tr style="background:rgba(201,168,76,0.06)"><td colspan="3" style="font-style:italic">🏁 Saldo Awal (${dStr(openingRow.date)})</td><td>-</td><td>-</td><td>-</td><td class="fw-bold text-gold">${idr(openingRow.balCash)}</td><td class="fw-bold text-gold">${idr(openingRow.balDigital)}</td><td class="fw-bold text-gold">${idr(openingRow.balTotal)}</td></tr>
+  ${!ledgerDesc.length?'<tr><td colspan="9" class="empty">Belum ada transaksi/pengeluaran sejak saldo awal diset</td></tr>':ledgerDesc.map(x=>`<tr><td style="white-space:nowrap">${dStr(x.date)}</td><td style="white-space:nowrap">${new Date(x.date).toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})}</td><td style="font-size:0.76rem">${x.desc}</td><td><span class="badge ${x.wallet==='Cash'?'badge-green':'badge-blue'}">${x.wallet==='Cash'?'💵 Cash':'📱 Digital'}</span></td><td class="text-success fw-bold">${x.type==='in'?idr(x.amount):'-'}</td><td class="text-danger fw-bold">${x.type==='out'?idr(x.amount):'-'}</td><td class="${x.balCash<0?'text-danger':''}">${idr(x.balCash)}</td><td class="${x.balDigital<0?'text-danger':''}">${idr(x.balDigital)}</td><td class="fw-bold ${x.balTotal<0?'text-danger':'text-gold'}">${idr(x.balTotal)}</td></tr>`).join('')}
+  </tbody></table></div></div>
+
   <div class="two-col">
-    <div class="card"><div class="card-header"><div class="card-title">📥 Pemasukan</div></div>
-    <div class="table-wrap" style="max-height:300px;overflow-y:auto"><table><thead><tr><th>Tanggal</th><th>Customer</th><th>Total</th><th>Profit</th></tr></thead><tbody>
-    ${mTx.slice().reverse().slice(0,30).map(t=>`<tr><td>${dStr(t.date)}</td><td>${t.customer||'Umum'}</td><td class="text-success fw-bold">${idr(t.total)}</td><td class="text-gold">${idr(t.profit||0)}</td></tr>`).join('')||'<tr><td colspan="4" class="empty">Belum ada data</td></tr>'}
+    <div class="card"><div class="card-header"><div class="card-title">📥 Pemasukan Bulan Ini</div></div>
+    <div class="table-wrap" style="max-height:300px;overflow-y:auto"><table><thead><tr><th>Tanggal</th><th>Customer</th><th>Metode</th><th>Total</th><th>Profit</th></tr></thead><tbody>
+    ${sortByDate(mTx).slice(0,30).map(t=>`<tr><td>${dStr(t.date)}</td><td>${t.customer||'Umum'}</td><td><span class="badge ${walletOfPayment(t.payment)==='Cash'?'badge-green':'badge-blue'}">${t.payment||'-'}</span></td><td class="text-success fw-bold">${idr(t.total)}</td><td class="text-gold">${idr(t.profit||0)}</td></tr>`).join('')||'<tr><td colspan="5" class="empty">Belum ada data</td></tr>'}
     </tbody></table></div></div>
-    <div class="card"><div class="card-header"><div class="card-title">📤 Pengeluaran</div><button class="btn btn-outline btn-sm" onclick="openAddExp()">+ Tambah</button></div>
-    <div class="table-wrap" style="max-height:300px;overflow-y:auto"><table><thead><tr><th>Tanggal</th><th>Kategori</th><th>Keterangan</th><th>Jumlah</th><th></th></tr></thead><tbody>
-    ${mEx.slice().reverse().map(e=>`<tr><td>${dStr(e.date)}</td><td><span class="badge badge-orange">${e.category||'-'}</span></td><td>${e.description||'-'}</td><td class="text-danger fw-bold">${idr(e.amount||0)}</td><td><button class="btn btn-danger btn-sm" onclick="delExp('${e.id}')">×</button></td></tr>`).join('')||'<tr><td colspan="5" class="empty">Belum ada pengeluaran</td></tr>'}
+    <div class="card"><div class="card-header"><div class="card-title">📤 Pengeluaran Bulan Ini</div><button class="btn btn-outline btn-sm" onclick="openAddExp()">+ Tambah</button></div>
+    <div class="table-wrap" style="max-height:300px;overflow-y:auto"><table><thead><tr><th>Tanggal</th><th>Kategori</th><th>Keterangan</th><th>Sumber</th><th>Jumlah</th><th></th></tr></thead><tbody>
+    ${sortByDate(mEx).map(e=>`<tr><td>${dStr(e.date)}</td><td><span class="badge badge-orange">${e.category||'-'}</span></td><td>${e.description||'-'}</td><td><span class="badge ${(e.metode||'Cash')==='Cash'?'badge-green':'badge-blue'}">${(e.metode||'Cash')==='Cash'?'💵 Cash':'📱 Digital'}</span></td><td class="text-danger fw-bold">${idr(e.amount||0)}</td><td><button class="btn btn-danger btn-sm" onclick="delExp('${e.id}')">×</button></td></tr>`).join('')||'<tr><td colspan="6" class="empty">Belum ada pengeluaran</td></tr>'}
     </tbody></table></div></div>
   </div>`;
 }
-function openAddExp(){openModal(`<div class="modal-hd"><h3>+ Catat Pengeluaran</h3><button class="modal-x" onclick="closeModal()">×</button></div><div class="modal-body"><div class="form-group"><label>Tanggal</label><input type="date" id="ex-date" value="${new Date().toISOString().slice(0,10)}"></div><div class="form-group"><label>Kategori</label><select id="ex-cat"><option>Beli Parfum</option><option>Botol Decant</option><option>Bubble Wrap</option><option>Kardus</option><option>Label</option><option>Ongkir</option><option>Operasional</option><option>Lainnya</option></select></div><div class="form-group"><label>Keterangan</label><input id="ex-desc" placeholder="Detail..."></div><div class="form-group"><label>Jumlah (Rp)</label><input type="number" id="ex-amt" placeholder="0" min="0"></div></div><div class="modal-ft"><button class="btn btn-outline" onclick="closeModal()">Batal</button><button class="btn btn-gold" onclick="saveExp()">Simpan</button></div>`);}
-async function saveExp(){
-  const date=document.getElementById('ex-date').value;const category=document.getElementById('ex-cat').value;const description=document.getElementById('ex-desc').value.trim();const amount=parseInt(document.getElementById('ex-amt').value)||0;
-  if(!amount){showNotif('Isi jumlah!','error');return;}
-  setSyncStatus('loading');await dbAdd('expenses',{date:new Date(date).toISOString(),category,description,amount});setSyncStatus('ok');closeModal();showNotif('Pengeluaran dicatat!','success');rKeuangan();
+function openSetSaldoAwal(){
+  const sa=LD.saldoAwal||{cash:0,digital:0,date:new Date().toISOString()};
+  openModal(`<div class="modal-hd"><h3>⚙ Atur Saldo Awal (Cash & Digital)</h3><button class="modal-x" onclick="closeModal()">×</button></div><div class="modal-body">
+  <div class="alert alert-info">Gunakan ini sebagai titik awal pencatatan yang rapi. Saldo Cash & Digital di bawah ini akan jadi patokan, lalu setiap transaksi/pengeluaran SETELAH tanggal ini otomatis menambah/mengurangi saldo — tidak mengubah data histori sebelumnya.</div>
+  <div class="form-group"><label>Tanggal Mulai Pencatatan</label><input type="date" id="sa-date" value="${new Date(sa.date||Date.now()).toISOString().slice(0,10)}"></div>
+  <div class="form-group"><label>Saldo Cash (Rp)</label><input type="number" id="sa-cash" value="${sa.cash||0}" min="0"></div>
+  <div class="form-group"><label>Saldo Digital / QRIS (Rp)</label><input type="number" id="sa-digital" value="${sa.digital||0}" min="0"></div>
+  <div style="font-size:0.8rem;color:var(--text-secondary)">Total saldo awal: <strong id="sa-total" class="text-gold">${idr((sa.cash||0)+(sa.digital||0))}</strong></div>
+  </div><div class="modal-ft"><button class="btn btn-outline" onclick="closeModal()">Batal</button><button class="btn btn-gold" onclick="saveSaldoAwal()">Simpan</button></div>`);
+  ['sa-cash','sa-digital'].forEach(id=>document.getElementById(id).addEventListener('input',()=>{
+    const c=parseInt(document.getElementById('sa-cash').value)||0;const d=parseInt(document.getElementById('sa-digital').value)||0;
+    document.getElementById('sa-total').textContent=idr(c+d);
+  }));
 }
-async function delExp(id){if(!confirm('Hapus pengeluaran?'))return;setSyncStatus('loading');await dbDelete('expenses',id);setSyncStatus('ok');showNotif('Dihapus!','success');rKeuangan();}
+async function saveSaldoAwal(){
+  const date=document.getElementById('sa-date').value;
+  const cash=parseInt(document.getElementById('sa-cash').value)||0;
+  const digital=parseInt(document.getElementById('sa-digital').value)||0;
+  LD.saldoAwal={cash,digital,date:new Date(date+'T00:00:00').toISOString()};
+  await saveSettings();closeModal();showNotif('Saldo awal disimpan! Saldo Cash & Digital dihitung ulang otomatis.','success');rKeuangan();
+}
+function openAddExp(){openModal(`<div class="modal-hd"><h3>+ Catat Pengeluaran</h3><button class="modal-x" onclick="closeModal()">×</button></div><div class="modal-body">
+  <div class="form-group"><label>Tanggal</label><input type="date" id="ex-date" value="${new Date().toISOString().slice(0,10)}"></div>
+  <div class="form-group"><label>Jam (opsional)</label><input type="time" id="ex-time" value="${new Date().toTimeString().slice(0,5)}"></div>
+  <div class="form-group"><label>Kategori</label><select id="ex-cat">${EXPENSE_CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select></div>
+  <div class="form-group"><label>Sumber Dana</label><select id="ex-metode"><option value="Cash">💵 Cash</option><option value="Digital">📱 Digital (QRIS/Transfer)</option></select></div>
+  <div class="form-group"><label>Keterangan</label><input id="ex-desc" placeholder="Contoh: Beli botol 5ml 100pcs..."></div>
+  <div class="form-group"><label>Jumlah (Rp)</label><input type="number" id="ex-amt" placeholder="0" min="0"></div>
+  </div><div class="modal-ft"><button class="btn btn-outline" onclick="closeModal()">Batal</button><button class="btn btn-gold" onclick="saveExp()">Simpan</button></div>`);}
+async function saveExp(){
+  const date=document.getElementById('ex-date').value;
+  const time=document.getElementById('ex-time').value||'00:00';
+  const category=document.getElementById('ex-cat').value;
+  const metode=document.getElementById('ex-metode').value;
+  const description=document.getElementById('ex-desc').value.trim();
+  const amount=parseInt(document.getElementById('ex-amt').value)||0;
+  if(!amount){showNotif('Isi jumlah!','error');return;}
+  const dt=new Date(date+'T'+time+':00');
+  setSyncStatus('loading');await dbAdd('expenses',{date:dt.toISOString(),category,metode,description,amount});setSyncStatus('ok');closeModal();showNotif((metode==='Cash'?'💵 Cash':'📱 Digital')+' berkurang otomatis! Saldo & profit diperbarui.','success');rKeuangan();
+}
+async function delExp(id){if(!confirm('Hapus pengeluaran?'))return;setSyncStatus('loading');await dbDelete('expenses',id);setSyncStatus('ok');showNotif('Dihapus! Saldo diperbarui.','success');rKeuangan();}
 
 // ===== LAPORAN =====
 async function rLaporan(){
@@ -997,7 +1099,7 @@ async function rLaporan(){
     <div class="stat-card"><div class="stat-label">Diskon</div><div class="stat-value text-danger" style="font-size:1.05rem">${idr(sum(todayTx,'discount'))}</div></div>
   </div>
   <div class="table-wrap mt-1" style="max-height:260px;overflow-y:auto"><table><thead><tr><th>Waktu</th><th>Customer</th><th>Item</th><th>Bayar</th><th>Total</th><th>Profit</th><th></th></tr></thead><tbody>
-  ${!todayTx.length?'<tr><td colspan="7" class="empty">Belum ada transaksi hari ini</td></tr>':todayTx.slice().reverse().map(t=>`<tr><td>${new Date(t.date).toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})}</td><td>${t.customer||'Umum'}</td><td style="font-size:0.73rem">${(t.items||[]).map(i=>i.name+' '+i.size+'ml×'+i.qty).join(', ')}</td><td><span class="badge badge-blue">${t.payment||'-'}</span></td><td class="text-success fw-bold">${idr(t.total)}</td><td class="text-gold">${idr(t.profit||0)}</td><td><button class="btn btn-danger btn-sm" onclick="delTx('${t.id}')">Hapus</button></td></tr>`).join('')}
+  ${!todayTx.length?'<tr><td colspan="7" class="empty">Belum ada transaksi hari ini</td></tr>':sortByDate(todayTx).map(t=>`<tr><td>${new Date(t.date).toLocaleTimeString('id-ID',{hour:'2-digit',minute:'2-digit'})}</td><td>${t.customer||'Umum'}</td><td style="font-size:0.73rem">${(t.items||[]).map(i=>i.name+' '+i.size+'ml×'+i.qty).join(', ')}</td><td><span class="badge badge-blue">${t.payment||'-'}</span></td><td class="text-success fw-bold">${idr(t.total)}</td><td class="text-gold">${idr(t.profit||0)}</td><td><button class="btn btn-danger btn-sm" onclick="delTx('${t.id}')">Hapus</button></td></tr>`).join('')}
   </tbody></table></div></div>
   <div class="card"><div class="card-header"><div class="card-title">🗓 Bulan Ini — ${new Date().toLocaleDateString('id-ID',{month:'long',year:'numeric'})}</div></div>
   <div class="stats-grid" style="grid-template-columns:repeat(4,1fr)">
@@ -1008,7 +1110,7 @@ async function rLaporan(){
   </div></div>
   <div class="card"><div class="card-header"><div class="card-title">📜 Riwayat Transaksi</div></div>
   <div class="table-wrap" style="max-height:380px;overflow-y:auto"><table><thead><tr><th>Tanggal</th><th>Customer</th><th>Item</th><th>Bayar</th><th>Total</th><th>Profit</th><th></th></tr></thead><tbody>
-  ${!txs.length?'<tr><td colspan="7" class="empty">Belum ada transaksi</td></tr>':[...txs].reverse().slice(0,120).map(t=>`<tr><td style="white-space:nowrap">${dStr(t.date)}</td><td>${t.customer||'Umum'}</td><td style="font-size:0.73rem">${(t.items||[]).map(i=>i.name+' '+i.size+'ml×'+i.qty).join(', ')}</td><td><span class="badge badge-blue">${t.payment||'-'}</span></td><td class="text-success fw-bold">${idr(t.total)}</td><td class="text-gold">${idr(t.profit||0)}</td><td><button class="btn btn-danger btn-sm" onclick="delTx('${t.id}')">Hapus</button></td></tr>`).join('')}
+  ${!txs.length?'<tr><td colspan="7" class="empty">Belum ada transaksi</td></tr>':sortByDate(txs).slice(0,120).map(t=>`<tr><td style="white-space:nowrap">${dStr(t.date)}</td><td>${t.customer||'Umum'}</td><td style="font-size:0.73rem">${(t.items||[]).map(i=>i.name+' '+i.size+'ml×'+i.qty).join(', ')}</td><td><span class="badge badge-blue">${t.payment||'-'}</span></td><td class="text-success fw-bold">${idr(t.total)}</td><td class="text-gold">${idr(t.profit||0)}</td><td><button class="btn btn-danger btn-sm" onclick="delTx('${t.id}')">Hapus</button></td></tr>`).join('')}
   </tbody></table></div></div>`;
 }
 async function delTx(id){
@@ -1152,7 +1254,7 @@ function rBackup(){
 async function doBackup(){
   showNotif('Menyiapkan backup...','');
   const txs=await dbGet('transactions');const cs=await dbGet('customers');const exps=await dbGet('expenses');
-  const bak={version:'1.0',exportedAt:new Date().toISOString(),exportedBy:currentUser?.name||currentUser?.email||'',transactions:txs,customers:cs,expenses:exps,products:LD.products,inventory:LD.inventory,prices:LD.prices,target:LD.target};
+  const bak={version:'1.0',exportedAt:new Date().toISOString(),exportedBy:currentUser?.name||currentUser?.email||'',transactions:txs,customers:cs,expenses:exps,products:LD.products,inventory:LD.inventory,prices:LD.prices,target:LD.target,saldoAwal:LD.saldoAwal};
   const blob=new Blob([JSON.stringify(bak,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='VanScents_Backup_'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(url);
   showNotif('Backup didownload!','success');
@@ -1176,7 +1278,7 @@ async function doRestore(){
       const b2=fbDb.batch();(restoreObj.customers||[]).forEach(c=>{b2.set(fbDb.collection('customers').doc(c.id||'cs'+Date.now()+Math.random().toString(36).slice(2)),c);});await b2.commit();
       setSyncStatus('ok');
     }else{LD.transactions=restoreObj.transactions||[];LD.customers=restoreObj.customers||[];LD.expenses=restoreObj.expenses||[];}
-    if(restoreObj.products)LD.products=restoreObj.products;if(restoreObj.inventory)LD.inventory=restoreObj.inventory;if(restoreObj.prices)LD.prices=restoreObj.prices;if(restoreObj.target)LD.target=restoreObj.target;
+    if(restoreObj.products)LD.products=restoreObj.products;if(restoreObj.inventory)LD.inventory=restoreObj.inventory;if(restoreObj.prices)LD.prices=restoreObj.prices;if(restoreObj.target)LD.target=restoreObj.target;if(restoreObj.saldoAwal)LD.saldoAwal=restoreObj.saldoAwal;
     await saveSettings();showNotif('✅ Data berhasil dipulihkan!','success');setTimeout(()=>nav('dashboard'),1200);
   }catch(e){setSyncStatus('err');showNotif('Gagal restore: '+e.message,'error');}
 }
